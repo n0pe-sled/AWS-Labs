@@ -43,7 +43,7 @@ New to AWS CLI or need a quick reference? Check out the [AWS CLI Cheatsheet](doc
 
 The easiest way to use this lab is to fork the repository and deploy labs using GitHub Actions:
 
-<img src="./docs/Setup/AWS%20Lab%20Setup%20&%20Deployment.gif" width="100%">
+<img src="./docs/Setup/setup.gif" width="100%">
 
 #### 1. Fork this Repository
 
