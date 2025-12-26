@@ -227,23 +227,6 @@ To avoid AWS costs, destroy the labs when you're finished:
 
 **Note:** Terraform will automatically detect which resources were deployed using the S3 remote state. No need to select individual labs - the state file tracks everything!
 
-#### 7. List Currently Deployed Labs
-
-To see which labs are currently deployed and get visibility into your AWS resources:
-
-1. Go to **Actions** tab in your repository
-2. Select **List Deployed Labs** workflow (on the left sidebar)
-3. Click **Run workflow**
-4. Click **Run workflow** button to confirm
-
-The workflow will display:
-- Active lab modules and their users
-- IAM roles with permission boundary status
-- Summary statistics (users, roles, policies)
-- Resource health checks
-
-**Automated Monitoring:** This workflow runs automatically every day at 9 AM UTC to provide visibility into deployed resources and help prevent forgotten labs from incurring unnecessary costs.
-
 ### Alternative: Local Deployment
 
 If you prefer to deploy locally:
