@@ -1,0 +1,11 @@
+# Example backend configuration for local Terraform runs
+# Copy this file to backend.hcl and customize with your values
+#
+# Usage:
+#   terraform init -backend-config=backend.hcl
+
+bucket = "specter-lab-tfstate-YOUR_AWS_ACCOUNT_ID"
+region = "us-east-1"
+
+# Note: The 'key' is already defined in terraform.tf
+# key = "specter-lab/terraform.tfstate"

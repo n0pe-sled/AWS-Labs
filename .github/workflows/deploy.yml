@@ -1,0 +1,208 @@
+name: Deploy Labs
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Lab module toggles
+      enable_createpolicyversion:
+        description: 'CreatePolicyVersion Lab'
+        type: boolean
+        default: true
+
+      enable_assumerole:
+        description: 'AssumeRole Lab'
+        type: boolean
+        default: false
+
+      enable_putuserpolicy:
+        description: 'PutUserPolicy Lab'
+        type: boolean
+        default: false
+
+      enable_attachrolepolicy:
+        description: 'AttachRolePolicy Lab'
+        type: boolean
+        default: false
+
+      enable_createcredentials:
+        description: 'CreateAccessKey/CreateLoginProfile Lab'
+        type: boolean
+        default: false
+
+      enable_updateassumerolepolicy:
+        description: 'UpdateAssumeRolePolicy Lab'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  deploy:
+    name: Deploy AWS Labs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup S3 Backend for Terraform State
+        run: |
+          # Get AWS Account ID
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="specter-lab-tfstate-${AWS_ACCOUNT_ID}"
+
+          echo "Using S3 bucket: $BUCKET_NAME"
+
+          # Check if bucket exists, create if it doesn't
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Creating S3 bucket for Terraform state..."
+            aws s3api create-bucket --bucket "$BUCKET_NAME" --region ${{ env.AWS_REGION }}
+
+            # Enable versioning for state file history
+            aws s3api put-bucket-versioning \
+              --bucket "$BUCKET_NAME" \
+              --versioning-configuration Status=Enabled
+
+            # Enable encryption
+            aws s3api put-bucket-encryption \
+              --bucket "$BUCKET_NAME" \
+              --server-side-encryption-configuration '{
+                "Rules": [{
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  },
+                  "BucketKeyEnabled": true
+                }]
+              }'
+
+            # Block public access
+            aws s3api put-public-access-block \
+              --bucket "$BUCKET_NAME" \
+              --public-access-block-configuration \
+                "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+            echo "S3 bucket created and configured"
+          else
+            echo "S3 bucket already exists"
+          fi
+
+          # Export for later steps
+          echo "TFSTATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var="enable_createpolicyversion_lab=${{ github.event.inputs.enable_createpolicyversion }}" \
+            -var="enable_assumerole_lab=${{ github.event.inputs.enable_assumerole }}" \
+            -var="enable_putuserpolicy_lab=${{ github.event.inputs.enable_putuserpolicy }}" \
+            -var="enable_attachrolepolicy_lab=${{ github.event.inputs.enable_attachrolepolicy }}" \
+            -var="enable_createcredentials_lab=${{ github.event.inputs.enable_createcredentials }}" \
+            -var="enable_updateassumerolepolicy_lab=${{ github.event.inputs.enable_updateassumerolepolicy }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Deployment Summary
+        run: |
+          echo "### AWS Labs Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Enabled Labs:**" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_createpolicyversion }}" = "true" ] && echo "- CreatePolicyVersion" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_assumerole }}" = "true" ] && echo "- AssumeRole" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_putuserpolicy }}" = "true" ] && echo "- PutUserPolicy" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_attachrolepolicy }}" = "true" ] && echo "- AttachRolePolicy" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_createcredentials }}" = "true" ] && echo "- CreateCredentials" >> $GITHUB_STEP_SUMMARY
+          [ "${{ github.event.inputs.enable_updateassumerolepolicy }}" = "true" ] && echo "- UpdateAssumeRolePolicy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Lab Access Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Use the assume-role commands below to access each lab:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get all outputs as JSON
+          OUTPUTS=$(terraform output -json)
+
+          # Function to print assume-role commands for a lab to summary
+          print_lab_exports() {
+            local lab_prefix=$1
+            local lab_name=$2
+            local instructions_path=$3
+            local walkthrough_path=$4
+
+            local entry_role_arn=$(echo "$OUTPUTS" | jq -r ".${lab_prefix}_entry_role_arn.value // empty")
+            local flag_role=$(echo "$OUTPUTS" | jq -r ".${lab_prefix}_flag_role_name.value // empty")
+
+            if [ -n "$entry_role_arn" ]; then
+              echo "### ${lab_name} Lab" >> $GITHUB_STEP_SUMMARY
+              echo "[Instructions](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/${instructions_path}) | [Walkthrough](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/${walkthrough_path})" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Assume the entry role to start this lab:**" >> $GITHUB_STEP_SUMMARY
+              echo '```bash' >> $GITHUB_STEP_SUMMARY
+              echo "# Assume the lab entry role" >> $GITHUB_STEP_SUMMARY
+              echo "ROLE_ARN=\"${entry_role_arn}\"" >> $GITHUB_STEP_SUMMARY
+              echo 'CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name lab-session --query '"'"'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'"'"' --output text)' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "# Export the temporary credentials" >> $GITHUB_STEP_SUMMARY
+              echo 'export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '"'"'{print $1}'"'"')' >> $GITHUB_STEP_SUMMARY
+              echo 'export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '"'"'{print $2}'"'"')' >> $GITHUB_STEP_SUMMARY
+              echo 'export AWS_SESSION_TOKEN=$(echo $CREDS | awk '"'"'{print $3}'"'"')' >> $GITHUB_STEP_SUMMARY
+              echo 'export AWS_DEFAULT_REGION="us-east-1"' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "# Verify your identity" >> $GITHUB_STEP_SUMMARY
+              echo "aws sts get-caller-identity" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              if [ -n "$flag_role" ]; then
+                echo "**Flag Role:** \`${flag_role}\`" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          }
+
+          # Print exports for each enabled lab
+          print_lab_exports "createpolicyversion" "CreatePolicyVersion" "docs/Labs/IAM-CreatePolicyVersion.md" "docs/Walkthroughs/IAM-CreatePolicyVersion.md"
+          print_lab_exports "assumerole" "AssumeRole" "docs/Labs/IAM-AssumeRole.md" "docs/Walkthroughs/IAM-AssumeRole.md"
+          print_lab_exports "putuserpolicy" "PutUserPolicy" "docs/Labs/IAM-PutUserPolicy.md" "docs/Walkthroughs/IAM-PutUserPolicy.md"
+          print_lab_exports "attachrolepolicy" "AttachRolePolicy" "docs/Labs/IAM-AttachRolePolicy.md" "docs/Walkthroughs/IAM-AttachRolePolicy.md"
+          print_lab_exports "createcredentials" "CreateCredentials" "docs/Labs/IAM-CreateCredentials.md" "docs/Walkthroughs/IAM-CreateCredentials.md"
+          print_lab_exports "updateassumerolepolicy" "UpdateAssumeRolePolicy" "docs/Labs/IAM-UpdateAssumeRolePolicy.md" "docs/Walkthroughs/IAM-UpdateAssumeRolePolicy.md"
+
+          echo "## Flag Retrieval" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "After successfully escalating privileges using your lab's entry role, retrieve the flag using the flag role name shown above:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo '# Replace <flag-role-name> with your lab'\''s specific flag role' >> $GITHUB_STEP_SUMMARY
+          echo 'aws iam get-role --role-name <flag-role-name> --query "Role.Tags[?Key==\`flag\`].Value" --output text' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** You must first assume the lab entry role using the commands above before starting the lab." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Remember to run the 'Destroy Labs' workflow when done to avoid AWS costs!**" >> $GITHUB_STEP_SUMMARY

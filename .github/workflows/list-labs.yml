@@ -1,0 +1,261 @@
+name: List Deployed Labs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  list-labs:
+    name: List Currently Deployed Labs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Get Terraform State Bucket
+        id: get_bucket
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="specter-lab-tfstate-${AWS_ACCOUNT_ID}"
+          echo "TFSTATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+
+          # Check if bucket exists
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "bucket_exists=false" >> $GITHUB_OUTPUT
+            echo "Warning: Terraform state bucket not found. No labs are deployed."
+          else
+            echo "bucket_exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init
+        if: steps.get_bucket.outputs.bucket_exists == 'true'
+        run: |
+          terraform init \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Get Deployed Labs
+        if: steps.get_bucket.outputs.bucket_exists == 'true'
+        id: get_labs
+        run: |
+          # Get all outputs as JSON
+          OUTPUTS=$(terraform output -json 2>/dev/null || echo "{}")
+
+          # Check which labs are deployed by looking for their outputs
+          echo "OUTPUTS<<EOF" >> $GITHUB_ENV
+          echo "$OUTPUTS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: List Deployed Labs via AWS
+        id: list_aws
+        run: |
+          echo "## Currently Deployed AWS Labs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Query Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if state bucket exists
+          if [ "${{ steps.get_bucket.outputs.bucket_exists }}" != "true" ]; then
+            echo "### Status: No Labs Deployed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The Terraform state bucket does not exist, indicating no labs have been deployed yet." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Run the **Deploy Labs** workflow to deploy labs." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Check for lab resources using IAM role prefix
+          LAB_PREFIX="specter-lab"
+
+          # List IAM entry roles with the lab prefix
+          echo "### Deployed Lab Entry Roles" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          ENTRY_ROLES=$(aws iam list-roles --query "Roles[?starts_with(RoleName, '${LAB_PREFIX}') && ends_with(RoleName, '-entry')].RoleName" --output text)
+
+          if [ -z "$ENTRY_ROLES" ]; then
+            echo "**Status:** No lab entry roles found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "*No Specter AWS Lab resources detected in the AWS account.*" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Lab | Entry Role Name | Status | Has Permission Boundary |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----|-----------------|--------|-------------------------|" >> $GITHUB_STEP_SUMMARY
+
+            for ROLE in $ENTRY_ROLES; do
+              # Determine lab type from role name
+              LAB_TYPE=""
+              if [[ $ROLE == *"createpolicyversion"* ]]; then
+                LAB_TYPE="CreatePolicyVersion"
+              elif [[ $ROLE == *"assumerole"* ]]; then
+                LAB_TYPE="AssumeRole"
+              elif [[ $ROLE == *"putuserpolicy"* ]]; then
+                LAB_TYPE="PutUserPolicy"
+              elif [[ $ROLE == *"attachrolepolicy"* ]]; then
+                LAB_TYPE="AttachRolePolicy"
+              elif [[ $ROLE == *"createcredentials"* ]]; then
+                LAB_TYPE="CreateCredentials"
+              elif [[ $ROLE == *"updateassumerolepolicy"* ]]; then
+                LAB_TYPE="UpdateAssumeRolePolicy"
+              else
+                LAB_TYPE="Unknown"
+              fi
+
+              # Check for permission boundary
+              BOUNDARY=$(aws iam get-role --role-name "$ROLE" --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text 2>/dev/null || echo "None")
+              if [ "$BOUNDARY" != "None" ] && [ -n "$BOUNDARY" ]; then
+                BOUNDARY_STATUS="Yes"
+              else
+                BOUNDARY_STATUS="No"
+              fi
+
+              echo "| $LAB_TYPE | \`$ROLE\` | Active | $BOUNDARY_STATUS |" >> $GITHUB_STEP_SUMMARY
+            done
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # List other IAM roles (excluding entry roles)
+          echo "### Other Lab Roles (Targets & Flag Holders)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          OTHER_ROLES=$(aws iam list-roles --query "Roles[?starts_with(RoleName, '${LAB_PREFIX}') && !ends_with(RoleName, '-entry')].RoleName" --output text)
+
+          if [ -z "$OTHER_ROLES" ]; then
+            echo "**Status:** No other lab roles found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Lab | Role Name | Type | Has Permission Boundary |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----|-----------|------|-------------------------|" >> $GITHUB_STEP_SUMMARY
+
+            for ROLE in $OTHER_ROLES; do
+              # Determine lab type and role type
+              LAB_TYPE=""
+              ROLE_TYPE=""
+              if [[ $ROLE == *"flag-holder"* ]]; then
+                ROLE_TYPE="Flag Holder"
+              elif [[ $ROLE == *"privileged"* ]]; then
+                ROLE_TYPE="Target"
+              elif [[ $ROLE == *"target"* ]]; then
+                ROLE_TYPE="Target"
+              else
+                ROLE_TYPE="Other"
+              fi
+
+              if [[ $ROLE == *"createpolicyversion"* ]]; then
+                LAB_TYPE="CreatePolicyVersion"
+              elif [[ $ROLE == *"assumerole"* ]]; then
+                LAB_TYPE="AssumeRole"
+              elif [[ $ROLE == *"putuserpolicy"* ]]; then
+                LAB_TYPE="PutUserPolicy"
+              elif [[ $ROLE == *"attachrolepolicy"* ]]; then
+                LAB_TYPE="AttachRolePolicy"
+              elif [[ $ROLE == *"createcredentials"* ]]; then
+                LAB_TYPE="CreateCredentials"
+              elif [[ $ROLE == *"updateassumerolepolicy"* ]]; then
+                LAB_TYPE="UpdateAssumeRolePolicy"
+              else
+                LAB_TYPE="Unknown"
+              fi
+
+              # Check for permission boundary
+              BOUNDARY=$(aws iam get-role --role-name "$ROLE" --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text 2>/dev/null || echo "None")
+              if [ "$BOUNDARY" != "None" ] && [ -n "$BOUNDARY" ]; then
+                BOUNDARY_STATUS="Yes"
+              else
+                BOUNDARY_STATUS="No"
+              fi
+
+              echo "| $LAB_TYPE | \`$ROLE\` | $ROLE_TYPE | $BOUNDARY_STATUS |" >> $GITHUB_STEP_SUMMARY
+            done
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # List managed policies
+          echo "### Deployed Lab Policies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          POLICIES=$(aws iam list-policies --scope Local --query "Policies[?starts_with(PolicyName, '${LAB_PREFIX}')].PolicyName" --output text)
+
+          if [ -z "$POLICIES" ]; then
+            echo "**Status:** No lab policies found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          else
+            POLICY_COUNT=$(echo "$POLICIES" | wc -w)
+            echo "**Total:** $POLICY_COUNT customer-managed policies" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Summary statistics
+          echo "### Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          ENTRY_ROLE_COUNT=$(echo "$ENTRY_ROLES" | wc -w)
+          OTHER_ROLE_COUNT=$(echo "$OTHER_ROLES" | wc -w)
+          TOTAL_ROLE_COUNT=$((ENTRY_ROLE_COUNT + OTHER_ROLE_COUNT))
+
+          # Count unique labs from entry roles
+          UNIQUE_LABS=$(echo "$ENTRY_ROLES" | tr ' ' '\n' | sed -E 's/specter-lab-([a-z]+)-.*/\1/' | sort -u | wc -l)
+
+          # Count any remaining IAM users (only privileged user from CreateCredentials lab)
+          LAB_USERS=$(aws iam list-users --query "Users[?starts_with(UserName, 'specter-lab')].UserName" --output text)
+          USER_COUNT=$(echo "$LAB_USERS" | wc -w)
+
+          echo "- **Active Lab Modules:** $UNIQUE_LABS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Entry Roles:** $ENTRY_ROLE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Other Roles (Targets/Flags):** $OTHER_ROLE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **IAM Users (Targets):** $USER_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Managed Policies:** $POLICY_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tip:** Run the **Destroy Labs** workflow to remove all deployed labs" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for Orphaned Resources
+        if: steps.get_bucket.outputs.bucket_exists == 'true'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resource Health Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check for permission boundaries on all lab entry roles
+          LAB_ENTRY_ROLES=$(aws iam list-roles --query "Roles[?starts_with(RoleName, 'specter-lab') && ends_with(RoleName, '-entry')].RoleName" --output text)
+
+          ROLES_WITHOUT_BOUNDARY=0
+          for ROLE in $LAB_ENTRY_ROLES; do
+            BOUNDARY=$(aws iam get-role --role-name "$ROLE" --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text 2>/dev/null || echo "None")
+            if [ "$BOUNDARY" == "None" ] || [ -z "$BOUNDARY" ]; then
+              ((ROLES_WITHOUT_BOUNDARY++))
+            fi
+          done
+
+          if [ $ROLES_WITHOUT_BOUNDARY -gt 0 ]; then
+            echo "**Warning:** $ROLES_WITHOUT_BOUNDARY entry role(s) found without permission boundaries" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "All lab entry roles have permission boundaries configured" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY

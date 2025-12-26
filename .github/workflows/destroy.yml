@@ -1,0 +1,83 @@
+name: Destroy Labs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  destroy:
+    name: Destroy AWS Labs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Get S3 Backend Bucket
+        run: |
+          # Get AWS Account ID
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="specter-lab-tfstate-${AWS_ACCOUNT_ID}"
+
+          echo "Using S3 bucket: $BUCKET_NAME"
+
+          # Verify bucket exists
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Warning: State bucket not found. This may be a fresh setup or already destroyed."
+          else
+            echo "State bucket found"
+          fi
+
+          # Export for later steps
+          echo "TFSTATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Show Resources to be Destroyed
+        run: |
+          echo "Checking Terraform state for deployed resources..."
+          terraform show -json | jq -r '.values.root_module.child_modules[]? | select(.address | startswith("module.iam_privesc_")) | .address' || echo "No lab modules found in state"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      - name: Destruction Summary
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "### AWS Labs Destroyed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All lab resources tracked in Terraform state have been removed from your AWS account." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** The S3 state bucket (\`specter-lab-tfstate-${ACCOUNT_ID}\`) is preserved for state history." >> $GITHUB_STEP_SUMMARY
+          echo "To delete it permanently (bucket has versioning enabled):" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "BUCKET=\"specter-lab-tfstate-${ACCOUNT_ID}\"" >> $GITHUB_STEP_SUMMARY
+          echo 'aws s3api list-object-versions --bucket $BUCKET --output json | \' >> $GITHUB_STEP_SUMMARY
+          echo '  jq '\''{Objects: [.Versions[]?, .DeleteMarkers[]? | {Key, VersionId}], Quiet: true}'\'' > /tmp/delete.json' >> $GITHUB_STEP_SUMMARY
+          echo 'aws s3api delete-objects --bucket $BUCKET --delete file:///tmp/delete.json' >> $GITHUB_STEP_SUMMARY
+          echo 'aws s3 rb s3://$BUCKET' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

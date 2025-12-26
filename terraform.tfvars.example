@@ -1,0 +1,13 @@
+# AWS Configuration
+aws_region  = "us-east-1"
+environment = "lab"
+lab_prefix  = "specter-lab"
+
+# Lab Module Toggles
+# Enable or disable specific privilege escalation labs
+#enable_createpolicyversion_lab = false
+#enable_assumerole_lab = false
+#enable_attachrolepolicy_lab = false
+#enable_putuserpolicy_lab = false
+#enable_createcredentials_lab = false
+#enable_updateassumerolepolicy_lab = false
